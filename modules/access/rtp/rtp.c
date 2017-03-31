@@ -266,6 +266,7 @@ static int Open (vlc_object_t *obj)
     p_sys->max_misorder = var_CreateGetInteger (obj, "rtp-max-misorder");
     p_sys->thread_ready = false;
     p_sys->autodetect   = true;
+    p_sys->frame_fragments  = NULL;
 
     demux->pf_demux   = NULL;
     demux->pf_control = Control;
@@ -336,6 +337,8 @@ static void Close (vlc_object_t *obj)
         rtp_session_destroy (demux, p_sys->session);
     if (p_sys->rtcp_fd != -1)
         net_Close (p_sys->rtcp_fd);
+    if (p_sys->frame_fragments != NULL)
+        block_ChainRelease(p_sys->frame_fragments);
     net_Close (p_sys->fd);
     free (p_sys);
 }
@@ -641,6 +644,104 @@ static void *ts_init (demux_t *demux)
     return stream_init (demux, *demux->psz_demux ? demux->psz_demux : "ts");
 }
 
+/* PT=34
+ * H263 (RFC2190)
+ */
+static void *h263_rfc2190_init (demux_t *demux)
+{
+    es_format_t fmt;
+
+    es_format_Init (&fmt, VIDEO_ES, VLC_CODEC_H263);
+    fmt.b_packetized = false;
+    return codec_init (demux, &fmt);
+}
+
+static void h263_rfc2190_decode (demux_t *demux, void *data, block_t *block)
+{
+    /** Overall plan to depacketize RFC2190 encoded stream **
+     * For each packet, read and strip the header.
+     * Add that packet to chain (possibly starting a chain).
+     * Is it last packet of frame?
+     * yes -> do a chaingather and send that to downstream.
+     */
+
+    /* Code below adapted from FFMPEG:
+       libavformat/rtpdec_h263_rfc2190.c */
+
+    /* Corresponding to header fields in the RFC */
+    int f, p, ebit, src, r;
+    int header_size;
+
+    const uint8_t * const buf = block->p_buffer;
+    const int len = block->i_buffer;
+
+    f = buf[0] & 0x80;
+    p = buf[0] & 0x40;
+    if (!f)
+    {
+        /* Mode A */
+        header_size = 4;
+        r = ((buf[1] & 0x01) << 3) | ((buf[2] & 0xe0) >> 5);
+    } else if (!p) {
+        /* Mode B */
+        header_size = 8;
+        if (len < header_size) {
+            msg_Err (demux,
+                     "Too short H.263 RTP packet: %d bytes, %d header bytes\n",
+                     len, header_size);
+            block_Release (block);
+            return;
+        }
+        r = buf[3] & 0x03;
+    } else {
+        /* Mode C */
+        header_size = 12;
+        if (len < header_size) {
+            msg_Err (demux,
+                     "Too short H.263 RTP packet: %d bytes, %d header bytes\n",
+                     len, header_size);
+            block_Release (block);
+            return;
+        }
+        r = buf[3] & 0x03;
+    }
+    ebit =  buf[0]       & 0x7;
+    src  = (buf[1] & 0xe0) >> 5;
+    if (!(buf[0] & 0xf8)) { /* Reserved bits in RFC 2429/4629 are zero */
+        if ((src == 0 || src >= 6) && r) {
+            /* Invalid src for this format, and bits that should be zero
+             * according to RFC 2190 aren't zero. */
+            msg_Warn(demux,
+                     "Stream might actually be RFC 2429/4629 encoded.");
+        }
+    }
+
+    block->i_buffer -= header_size; /* Strip RFC2190 header */
+    block->p_buffer += header_size;
+
+    if (ebit != 0) {
+        block->i_buffer --;
+    }
+
+    demux_sys_t *p_sys = demux->p_sys;
+    block_ChainAppend(&p_sys->frame_fragments, block);
+
+    if (p_sys->marker_bit)
+    {
+        /* RFC2190: "The Marker bit of the RTP fixed header is set to
+           1 when the current packet carries the end of current frame;
+           set to 0 otherwise. */
+
+        block_t *gathered_block = block_ChainGather(p_sys->frame_fragments);
+
+        /* Interestingly, current block_ChainAppend and
+           block_ChainGather implementation is O(1) and does not copy
+           anything when only one packet is transmitted. */
+
+        p_sys->frame_fragments = NULL;
+        codec_decode (demux, data, gathered_block);
+    }
+}
 
 /* Not using SDP, we need to guess the payload format used */
 /* see http://www.iana.org/assignments/rtp-parameters */
@@ -714,6 +815,13 @@ void rtp_autodetect (demux_t *demux, rtp_session_t *session,
         pt.init = ts_init;
         pt.destroy = stream_destroy;
         pt.decode = stream_decode;
+        pt.frequency = 90000;
+        break;
+
+      case 34:
+        msg_Dbg (demux, "detected H.263");
+        pt.init = h263_rfc2190_init;
+        pt.decode = h263_rfc2190_decode;
         pt.frequency = 90000;
         break;
 

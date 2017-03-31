@@ -483,6 +483,7 @@ void rtp_dequeue_force (demux_t *demux, const rtp_session_t *session)
 static void
 rtp_decode (demux_t *demux, const rtp_session_t *session, rtp_source_t *src)
 {
+    demux_sys_t *p_sys = demux->p_sys;
     block_t *block = src->blocks;
 
     assert (block);
@@ -541,6 +542,8 @@ rtp_decode (demux_t *demux, const rtp_session_t *session, rtp_source_t *src)
     if (block->i_buffer < skip)
         goto drop;
 
+    p_sys->marker_bit = (block->p_buffer[1] & 0x80) != 0;
+    
     block->p_buffer += skip;
     block->i_buffer -= skip;
 
