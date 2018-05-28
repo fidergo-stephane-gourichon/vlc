@@ -79,5 +79,11 @@ typedef struct
     uint8_t       max_src; /**< Max simultaneous RTP sources */
     bool          thread_ready;
     bool          autodetect; /**< Payload type autodetection pending */
+    bool          marker_bit; /**< RFC1889/3550 marker (M) bit: 
+                                 "intended to allow significant events 
+                                 such as frame boundaries to be marked
+                                 in the packet stream" */
+    block_t       *frame_fragments; /**< Fragments of a frame being 
+                                       reassembled from RFC2190 packets */
 } demux_sys_t;
 
